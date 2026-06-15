@@ -31,7 +31,7 @@ import {
   updatePayrollRun,
 } from "@/lib/firestore";
 import { db } from "@/lib/firebase";
-import { calculateAnomalyScore } from "@/lib/scoringEngine";
+import { scoreTransaction } from "@/lib/scoringClient";
 import { useAppStore } from "@/store/useAppStore";
 import type {
   Employee,
@@ -40,7 +40,7 @@ import type {
   PayrollRun,
   RunStatus,
 } from "@/types";
-import { writeBatch, doc, collection, Timestamp } from "firebase/firestore";
+import { writeBatch, doc, collection, Timestamp, getDocs, query, where, limit } from "firebase/firestore";
 import toast from "react-hot-toast";
 
 // ─── Status badge ────────────────────────────────────────────────────────────
@@ -120,7 +120,19 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
     const now = Timestamp.now();
 
     try {
-      // 1. Create payroll run in PROCESSING state
+      // ── Idempotency guard ───────────────────────────────────────────────────
+      // Prevent double-processing: abort if transactions already exist for this label
+      appendLog("Checking for duplicate runs…");
+      const existingRuns = await getDocs(
+        query(collection(db, "payroll_runs"), where("runLabel", "==", runLabel.trim()), limit(1))
+      );
+      if (!existingRuns.empty) {
+        toast.error(`A run named "${runLabel.trim()}" already exists.`);
+        appendLog("Error: Duplicate run detected — aborting.");
+        return;
+      }
+
+      // ── Step 1: Create run in PROCESSING state ──────────────────────────────
       appendLog("Creating payroll run…");
       const initialRun: PayrollRun = {
         id: runId,
@@ -136,13 +148,13 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
       };
       await createPayrollRun(initialRun);
 
-      // 2. Fetch employees
+      // ── Step 2: Fetch employees ─────────────────────────────────────────────
       appendLog("Fetching employees…");
       const allEmployees = await getEmployees();
       const employees = allEmployees.filter((e) => e.isActive);
       appendLog(`Found ${employees.length} active employees.`);
 
-      // 3. Fetch risk config
+      // ── Step 3: Load risk config ────────────────────────────────────────────
       appendLog("Loading risk configuration…");
       const config = await getRiskConfig();
       const thresholds = {
@@ -150,7 +162,19 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
         review: config.anomalyScoreReview,
       };
 
-      // 4. Build routing-hash frequency map for shared routing detection
+      // ── Step 4: Check ML service availability ───────────────────────────────
+      let mlOnline = false;
+      try {
+        const healthRes = await fetch("/api/ml-health", { cache: "no-store" });
+        const health = await healthRes.json();
+        mlOnline = health.online && health.modelLoaded;
+      } catch { /* ignore */ }
+      appendLog(mlOnline
+        ? "ML service online — using Isolation Forest scoring."
+        : "ML service offline — using rule-based fallback scoring."
+      );
+
+      // ── Step 5: Build routing-hash frequency map ────────────────────────────
       const routingHashFreq = new Map<string, number>();
       for (const emp of employees) {
         routingHashFreq.set(
@@ -159,41 +183,35 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
         );
       }
 
-      // 5. Score and compute payslips
-      appendLog("Scoring transactions…");
+      // ── Step 6: Score each employee, compute payslips ───────────────────────
+      appendLog("Running anomaly detection…");
 
       let totalGross = 0;
       let totalNet = 0;
       let flaggedCount = 0;
       let clearedCount = 0;
       let quarantinedCount = 0;
+      let quarantinedDropped = 0;
 
       const batch = writeBatch(db);
       const auditPromises: Promise<void>[] = [];
 
       for (const emp of employees) {
-        const monthly = emp.baseSalaryInr; // baseSalaryInr is already the monthly figure
+        const monthly = emp.baseSalaryInr; // already monthly
 
-        // Earnings breakdown
         const earnings: IndianEarnings = {
-          basic: parseFloat((monthly * 0.4).toFixed(2)),
-          hra: parseFloat((monthly * 0.2).toFixed(2)),
-          specialAllowance: parseFloat((monthly * 0.1).toFixed(2)),
-          foodAllowance: parseFloat((monthly * 0.08).toFixed(2)),
-          flexiPay: parseFloat((monthly * 0.15).toFixed(2)),
-          fuelAllowance: parseFloat((monthly * 0.07).toFixed(2)),
+          basic:            parseFloat((monthly * 0.40).toFixed(2)),
+          hra:              parseFloat((monthly * 0.20).toFixed(2)),
+          specialAllowance: parseFloat((monthly * 0.10).toFixed(2)),
+          foodAllowance:    parseFloat((monthly * 0.08).toFixed(2)),
+          flexiPay:         parseFloat((monthly * 0.15).toFixed(2)),
+          fuelAllowance:    parseFloat((monthly * 0.07).toFixed(2)),
         };
-
         const totalEarnings = parseFloat(
-          Object.values(earnings)
-            .reduce((a, b) => a + b, 0)
-            .toFixed(2)
+          Object.values(earnings).reduce((a, b) => a + b, 0).toFixed(2)
         );
 
-        // Deductions
-        const pfEmployee = parseFloat(
-          Math.min(earnings.basic * 0.12, 1800).toFixed(2)
-        );
+        const pfEmployee = parseFloat(Math.min(earnings.basic * 0.12, 1800).toFixed(2));
         const pfEmployer = pfEmployee;
         const deductions: IndianDeductions = {
           pfEmployee,
@@ -203,94 +221,83 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
           foodAllowanceDeduction: earnings.foodAllowance,
           fuelAllowanceDeduction: earnings.fuelAllowance,
         };
-
-        const totalContributions = parseFloat(
-          (pfEmployee + pfEmployer).toFixed(2)
-        );
+        const totalContributions = parseFloat((pfEmployee + pfEmployer).toFixed(2));
         const totalDeductions = parseFloat(
-          (
-            deductions.professionalTax +
-            deductions.incomeTax +
-            deductions.foodAllowanceDeduction +
-            deductions.fuelAllowanceDeduction
-          ).toFixed(2)
+          (deductions.professionalTax + deductions.incomeTax +
+           deductions.foodAllowanceDeduction + deductions.fuelAllowanceDeduction).toFixed(2)
         );
-        const netPayable = parseFloat(
-          (totalEarnings - pfEmployee - totalDeductions).toFixed(2)
-        );
+        const netPayable = parseFloat((totalEarnings - pfEmployee - totalDeductions).toFixed(2));
 
-        // Routing-change detection (changed within last 48 h)
         const routingChangedWithin48h =
           emp.routingChangedAt != null &&
-          now.toMillis() - emp.routingChangedAt.toMillis() <
-            48 * 60 * 60 * 1000;
-
-        // Bank account freshness (created within last 30 days)
+          now.toMillis() - emp.routingChangedAt.toMillis() < 48 * 60 * 60 * 1000;
         const isBankAccountNew =
           now.toMillis() - emp.createdAt.toMillis() < 30 * 24 * 60 * 60 * 1000;
+        const sharedRoutingHashCount = routingHashFreq.get(emp.bankRoutingHash) ?? 1;
 
-        const sharedRoutingHashCount =
-          routingHashFreq.get(emp.bankRoutingHash) ?? 1;
+        // ── Inline Risk Interceptor Gate (Phase 6) ────────────────────────────
+        // Call scoring client — uses ML service with rule-engine fallback
+        const scoring = await scoreTransaction({
+          employeeId:              emp.id,
+          grossInr:                totalEarnings,
+          avgMonthlyPay:           emp.avgMonthlyPay,
+          routingChangedWithin48h,
+          isBankAccountNew,
+          sharedRoutingHashCount,
+          department:              emp.department,
+          thresholds,
+        });
 
-        // Anomaly scoring
-        const scoring = calculateAnomalyScore(
-          {
-            grossEarningsInr: totalEarnings,
-            routingChangedWithin48h,
-            isBankAccountNew,
-            sharedRoutingHashCount,
-          },
-          { avgMonthlyPay: emp.avgMonthlyPay },
-          thresholds
-        );
+        // Validation token gate: quarantined transactions have no token
+        // They are recorded but dropped from the live payment batch
+        if (scoring.status === "QUARANTINED") {
+          quarantinedDropped++;
+          appendLog(`⚠ ${emp.name} QUARANTINED (score: ${scoring.anomalyScore}) — dropped from payment batch`);
+        }
 
-        // Accumulate totals
         totalGross += totalEarnings;
-        totalNet += netPayable;
+        totalNet   += scoring.status !== "QUARANTINED" ? netPayable : 0;
         if (scoring.status === "CLEARED") clearedCount++;
         else {
           flaggedCount++;
           if (scoring.status === "QUARANTINED") quarantinedCount++;
         }
 
-        // Transaction doc
-        const txId = `tx_${runId}_${emp.id}`;
+        const txId  = `tx_${runId}_${emp.id}`;
         const txRef = doc(db, "transactions", txId);
         batch.set(txRef, {
           id: txId,
           payrollRunId: runId,
-          employeeId: emp.id,
+          employeeId:   emp.id,
           employeeName: emp.name,
-          department: emp.department,
-          grossEarningsInr: totalEarnings,
+          department:   emp.department,
+          grossEarningsInr:       totalEarnings,
           deductions,
-          netDisbursableInr: netPayable,
+          netDisbursableInr:      netPayable,
           destinationRoutingHash: emp.bankRoutingHash,
-          createdAt: now,
-          status: scoring.status,
-          anomalyScore: scoring.anomalyScore,
-          riskLevel: scoring.riskLevel,
-          flagReasons: scoring.flagReasons,
-          shapContributions: scoring.shapContributions,
-          validationToken: scoring.validationToken,
-          reviewedBy: null,
-          reviewNote: null,
+          createdAt:              now,
+          status:                 scoring.status,
+          anomalyScore:           scoring.anomalyScore,
+          riskLevel:              scoring.riskLevel,
+          flagReasons:            scoring.flagReasons,
+          shapContributions:      scoring.shapContributions,
+          validationToken:        scoring.validationToken,
+          reviewedBy:             null,
+          reviewNote:             null,
           routingChangedWithin48h,
           isBankAccountNew,
           sharedRoutingHashCount,
+          modelVersion:           scoring.modelVersion,
+          inferenceMs:            scoring.inferenceMs,
         });
 
-        // Payslip doc
-        const psId = `ps_${runId}_${emp.id}`;
+        const psId  = `ps_${runId}_${emp.id}`;
         const psRef = doc(db, "payslips", psId);
         batch.set(psRef, {
           id: psId,
-          employeeId: emp.id,
+          employeeId:   emp.id,
           employeeName: emp.name,
-          month: new Date().toLocaleString("en-IN", {
-            month: "long",
-            year: "numeric",
-          }),
+          month: new Date().toLocaleString("en-IN", { month: "long", year: "numeric" }),
           payrollRunId: runId,
           earnings,
           deductions,
@@ -298,66 +305,74 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
           totalContributions,
           totalDeductions,
           netPayable,
-          paidOn: now,
-          department: emp.department,
-          role: emp.role,
-          panNumber: emp.panNumber,
+          paidOn:         now,
+          department:     emp.department,
+          role:           emp.role,
+          panNumber:      emp.panNumber,
           pfAccountNumber: emp.pfAccountNumber,
-          location: emp.location,
-          workingDays: 22,
-          lopDays: 0,
+          location:       emp.location,
+          workingDays:    22,
+          lopDays:        0,
         });
 
-        // Queue audit log for flagged / quarantined transactions
         if (scoring.status !== "CLEARED") {
-          auditPromises.push(
-            addAuditLog({
-              timestamp: now,
-              action:
-                scoring.status === "QUARANTINED"
-                  ? "transaction_quarantined"
-                  : "transaction_flagged_for_review",
-              entityType: "transaction",
-              entityId: txId,
-              performedBy: user?.email ?? "system",
-              details: {
-                employeeId: emp.id,
-                employeeName: emp.name,
-                anomalyScore: scoring.anomalyScore,
-                riskLevel: scoring.riskLevel,
-                flagReasons: scoring.flagReasons,
-              },
-            })
-          );
+          auditPromises.push(addAuditLog({
+            timestamp:  now,
+            action:     scoring.status === "QUARANTINED"
+                          ? "transaction_quarantined"
+                          : "transaction_flagged_for_review",
+            entityType: "transaction",
+            entityId:   txId,
+            performedBy: user?.email ?? "system",
+            details: {
+              employeeId:   emp.id,
+              employeeName: emp.name,
+              anomalyScore: scoring.anomalyScore,
+              riskLevel:    scoring.riskLevel,
+              flagReasons:  scoring.flagReasons,
+              modelVersion: scoring.modelVersion,
+              droppedFromBatch: scoring.status === "QUARANTINED",
+            },
+          }));
         }
       }
 
-      // 6. Commit batch
-      appendLog("Writing to Firestore…");
+      // ── Step 7: Commit batch ────────────────────────────────────────────────
+      appendLog("Writing transactions and payslips to Firestore…");
       await batch.commit();
 
-      // 7. Write audit logs (non-blocking parallel)
+      // ── Step 7 audit logs ───────────────────────────────────────────────────
       if (auditPromises.length > 0) {
-        appendLog(`Writing ${auditPromises.length} audit log entries…`);
+        appendLog(`Writing ${auditPromises.length} audit entries…`);
         await Promise.all(auditPromises);
       }
 
-      // 8. Mark run COMPLETED
+      // ── Phase 7: Banking API Gateway (stub) ─────────────────────────────────
+      const payableCount = employees.length - quarantinedDropped;
+      appendLog(`Dispatching ${payableCount} payments to banking gateway…`);
+      await new Promise((r) => setTimeout(r, 600)); // simulate network call
+      toast("Banking gateway: payment dispatch simulated — integration pending.", {
+        icon: "🏦",
+        style: { background: "#1e3a5f", color: "#93c5fd", border: "1px solid #1d4ed8" },
+        duration: 5000,
+      });
+      appendLog(`Banking gateway stub: ${payableCount} payments queued (simulation).`);
+
+      // ── Step 8: Mark run COMPLETED ──────────────────────────────────────────
       await updatePayrollRun(runId, {
-        status: "COMPLETED",
-        totalEmployees: employees.length,
-        totalGrossInr: parseFloat(totalGross.toFixed(2)),
-        totalNetInr: parseFloat(totalNet.toFixed(2)),
+        status:          "COMPLETED",
+        totalEmployees:  employees.length,
+        totalGrossInr:   parseFloat(totalGross.toFixed(2)),
+        totalNetInr:     parseFloat(totalNet.toFixed(2)),
         flaggedCount,
         clearedCount,
         quarantinedCount,
       });
 
-      appendLog("Complete!");
-      toast.success(`Payroll run "${runLabel}" completed successfully.`);
+      appendLog(`✓ Complete — ${clearedCount} cleared, ${quarantinedDropped} quarantined & held.`);
+      toast.success(`Payroll run completed. ${quarantinedDropped > 0 ? `${quarantinedDropped} transaction(s) held for review.` : "All transactions cleared."}`);
 
-      // Small delay so user can read "Complete!" before dialog closes
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 900));
       onOpenChange(false);
       setLog([]);
       setRunLabel(defaultRunLabel());

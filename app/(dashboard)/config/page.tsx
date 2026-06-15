@@ -1,13 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import toast from "react-hot-toast";
 import { getRiskConfig, saveRiskConfig } from "@/lib/firestore";
-import type { RiskConfig } from "@/types";
+import { getDocs, collection, query, orderBy, limit } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import type { RiskConfig, Transaction } from "@/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 
 const DEFAULT_CONFIG: RiskConfig = {
   anomalyScoreQuarantine: 0.75,
@@ -18,10 +21,21 @@ const DEFAULT_CONFIG: RiskConfig = {
   adaptiveScalingEnabled: false,
 };
 
+interface MlHealth {
+  online: boolean;
+  modelLoaded: boolean;
+  modelVersion?: string;
+  trainedAt?: string;
+  nSamples?: number;
+  featureImportance?: Record<string, number>;
+}
+
 export default function ConfigPage() {
   const [config, setConfig] = useState<RiskConfig>(DEFAULT_CONFIG);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [mlHealth, setMlHealth] = useState<MlHealth | null>(null);
+  const [training, setTraining] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -35,10 +49,64 @@ export default function ConfigPage() {
         if (!cancelled) setLoading(false);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
+
+  const fetchMlHealth = useCallback(async () => {
+    try {
+      const res = await fetch("/api/ml-health", { cache: "no-store" });
+      setMlHealth(await res.json());
+    } catch {
+      setMlHealth({ online: false, modelLoaded: false });
+    }
+  }, []);
+
+  useEffect(() => { fetchMlHealth(); }, [fetchMlHealth]);
+
+  async function handleTrain() {
+    setTraining(true);
+    try {
+      // Fetch last 500 transactions as training data
+      const snap = await getDocs(
+        query(collection(db, "transactions"), orderBy("createdAt", "desc"), limit(500))
+      );
+      const txs = snap.docs.map(d => d.data() as Transaction);
+
+      if (txs.length < 10) {
+        toast.error("Not enough transaction data to train. Run payroll first.");
+        return;
+      }
+
+      const samples = txs.map(tx => ({
+        grossInr:                tx.grossEarningsInr,
+        avgMonthlyPay:           tx.grossEarningsInr, // best proxy available in tx doc
+        routingChangedWithin48h: tx.routingChangedWithin48h,
+        isBankAccountNew:        tx.isBankAccountNew,
+        sharedRoutingHashCount:  tx.sharedRoutingHashCount,
+        department:              tx.department,
+        isAnomaly:               tx.status === "QUARANTINED" || tx.riskLevel === "CRITICAL" ? true : null,
+      }));
+
+      const res = await fetch("/api/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ samples, contamination: 0.08 }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error ?? "Training failed");
+      }
+
+      const result = await res.json();
+      toast.success(`Model trained on ${result.nSamples} samples in ${result.trainingMs}ms. Version: ${result.version}`);
+      await fetchMlHealth();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Training failed");
+    } finally {
+      setTraining(false);
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -278,6 +346,98 @@ export default function ConfigPage() {
                 </p>
               </div>
             </label>
+          </CardContent>
+        </Card>
+
+        {/* ML Engine Status */}
+        <Card className="bg-slate-800 border-slate-700">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-slate-100 text-base font-semibold">
+                AI Engine — Isolation Forest
+              </CardTitle>
+              {mlHealth && (
+                <Badge className={mlHealth.online
+                  ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                  : "bg-red-500/20 text-red-400 border border-red-500/30"
+                }>
+                  {mlHealth.online ? "● Online" : "● Offline"}
+                </Badge>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {!mlHealth ? (
+              <p className="text-slate-500 text-sm">Checking ML service…</p>
+            ) : !mlHealth.online ? (
+              <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-4">
+                <p className="text-amber-400 text-sm font-medium">ML service is offline</p>
+                <p className="text-slate-400 text-xs mt-1">
+                  Run <code className="bg-slate-700 px-1.5 py-0.5 rounded text-indigo-300">cd ml-service && uvicorn main:app --reload</code> to start it.
+                  The rule-based fallback engine will be used until it&apos;s online.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {[
+                    { label: "Status", value: mlHealth.modelLoaded ? "Model Loaded" : "No Model" },
+                    { label: "Version", value: mlHealth.modelVersion ?? "—" },
+                    { label: "Trained On", value: mlHealth.nSamples ? `${mlHealth.nSamples} samples` : "—" },
+                    { label: "Last Trained", value: mlHealth.trainedAt
+                        ? new Date(mlHealth.trainedAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
+                        : "Never" },
+                  ].map(({ label, value }) => (
+                    <div key={label} className="bg-slate-900/50 rounded-lg p-3">
+                      <p className="text-slate-500 text-xs uppercase tracking-wider mb-1">{label}</p>
+                      <p className="text-slate-200 text-sm font-medium truncate">{value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {mlHealth.featureImportance && Object.keys(mlHealth.featureImportance).length > 0 && (
+                  <div>
+                    <p className="text-slate-400 text-xs uppercase tracking-wider mb-2">Feature Importance (SHAP)</p>
+                    <div className="space-y-1.5">
+                      {Object.entries(mlHealth.featureImportance)
+                        .sort(([, a], [, b]) => b - a)
+                        .map(([feat, val]) => (
+                          <div key={feat} className="flex items-center gap-3">
+                            <span className="text-slate-400 text-xs w-40 truncate">{feat.replace(/_/g, " ")}</span>
+                            <div className="flex-1 bg-slate-700 rounded-full h-1.5">
+                              <div
+                                className="bg-indigo-500 h-1.5 rounded-full transition-all"
+                                style={{ width: `${Math.round(val * 100)}%` }}
+                              />
+                            </div>
+                            <span className="text-slate-400 text-xs w-10 text-right">{Math.round(val * 100)}%</span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center gap-3 pt-1">
+                  <Button
+                    onClick={handleTrain}
+                    disabled={training}
+                    className="bg-violet-600 hover:bg-violet-700 text-white text-sm"
+                  >
+                    {training ? (
+                      <span className="flex items-center gap-2">
+                        <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                        Training…
+                      </span>
+                    ) : (
+                      "Train Model on Transaction History"
+                    )}
+                  </Button>
+                  <p className="text-slate-500 text-xs">
+                    Uses last 500 transactions. Retrain every {config.modelDriftDaysInterval} days.
+                  </p>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 
