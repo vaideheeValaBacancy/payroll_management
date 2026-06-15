@@ -10,17 +10,26 @@ interface ScoreInput {
   employeeId: string;
   grossInr: number;
   avgMonthlyPay: number;
+  deptMeanPay?: number;
   routingChangedWithin48h: boolean;
   isBankAccountNew: boolean;
   sharedRoutingHashCount: number;
   department: string;
+  routingHash?: string;
   thresholds: { quarantine: number; review: number };
+}
+
+export interface ModelScores {
+  iforest: number | null;
+  autoencoder: number | null;
+  xgboost: number | null;
 }
 
 export interface ScoringResultWithMeta extends ScoringResult {
   modelVersion: string;
   inferenceMs: number;
   usedFallback: boolean;
+  modelScores?: ModelScores;
 }
 
 export async function scoreTransaction(input: ScoreInput): Promise<ScoringResultWithMeta> {
@@ -43,6 +52,7 @@ export async function scoreTransaction(input: ScoreInput): Promise<ScoringResult
         modelVersion:      data.modelVersion ?? "ml-service",
         inferenceMs:       data.inferenceMs ?? 0,
         usedFallback:      false,
+        modelScores:       data.modelScores,
       };
     }
   } catch {

@@ -170,18 +170,27 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
         mlOnline = health.online && health.modelLoaded;
       } catch { /* ignore */ }
       appendLog(mlOnline
-        ? "ML service online — using Isolation Forest scoring."
+        ? "ML service online — using dual-model engine (Isolation Forest + Autoencoder + XGBoost)."
         : "ML service offline — using rule-based fallback scoring."
       );
 
-      // ── Step 5: Build routing-hash frequency map ────────────────────────────
+      // ── Step 5: Build routing-hash frequency + department mean maps ──────────
       const routingHashFreq = new Map<string, number>();
+      const deptTotals = new Map<string, { sum: number; count: number }>();
       for (const emp of employees) {
         routingHashFreq.set(
           emp.bankRoutingHash,
           (routingHashFreq.get(emp.bankRoutingHash) ?? 0) + 1
         );
+        const d = deptTotals.get(emp.department) ?? { sum: 0, count: 0 };
+        d.sum += emp.baseSalaryInr;
+        d.count += 1;
+        deptTotals.set(emp.department, d);
       }
+      const deptMean = (dept: string) => {
+        const d = deptTotals.get(dept);
+        return d && d.count > 0 ? d.sum / d.count : 0;
+      };
 
       // ── Step 6: Score each employee, compute payslips ───────────────────────
       appendLog("Running anomaly detection…");
@@ -241,10 +250,12 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
           employeeId:              emp.id,
           grossInr:                totalEarnings,
           avgMonthlyPay:           emp.avgMonthlyPay,
+          deptMeanPay:             deptMean(emp.department),
           routingChangedWithin48h,
           isBankAccountNew,
           sharedRoutingHashCount,
           department:              emp.department,
+          routingHash:             emp.bankRoutingHash,
           thresholds,
         });
 
@@ -289,6 +300,7 @@ function RunPayrollDialog({ open, onOpenChange }: RunPayrollDialogProps) {
           sharedRoutingHashCount,
           modelVersion:           scoring.modelVersion,
           inferenceMs:            scoring.inferenceMs,
+          modelScores:            scoring.modelScores ?? null,
         });
 
         const psId  = `ps_${runId}_${emp.id}`;

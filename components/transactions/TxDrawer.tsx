@@ -1,5 +1,4 @@
 "use client";
-import { useState, useEffect } from "react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { AnomalyGauge } from "./AnomalyGauge";
@@ -12,63 +11,19 @@ import type { Transaction } from "@/types";
 import toast from "react-hot-toast";
 import { useAppStore } from "@/store/useAppStore";
 
-interface FraudAnalysis {
-  headline: string;
-  riskNarrative: string;
-  topSignal: string;
-  recommendation: string;
-  fraudPattern: string;
-  confidence: "HIGH" | "MEDIUM" | "LOW";
-  falsePositiveReason: string | null;
-}
-
 interface Props {
   tx: Transaction | null;
   onClose: () => void;
 }
 
-const confidenceColors = {
-  HIGH:   "text-red-400 bg-red-500/10 border-red-500/30",
-  MEDIUM: "text-amber-400 bg-amber-500/10 border-amber-500/30",
-  LOW:    "text-green-400 bg-green-500/10 border-green-500/30",
-};
+const MODELS = [
+  { key: "iforest", label: "Isolation Forest", sub: "unsupervised · path-length", color: "bg-indigo-500" },
+  { key: "autoencoder", label: "Autoencoder", sub: "unsupervised · reconstruction", color: "bg-violet-500" },
+  { key: "xgboost", label: "XGBoost", sub: "supervised · classifier", color: "bg-fuchsia-500" },
+] as const;
 
 export function TxDrawer({ tx, onClose }: Props) {
   const { user } = useAppStore();
-  const [analysis, setAnalysis]   = useState<FraudAnalysis | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysisError, setAnalysisError] = useState<string | null>(null);
-
-  // Run LLM analysis whenever a new transaction is opened
-  useEffect(() => {
-    if (!tx) {
-      setAnalysis(null);
-      setAnalysisError(null);
-      return;
-    }
-
-    async function runAnalysis() {
-      setAnalyzing(true);
-      setAnalysis(null);
-      setAnalysisError(null);
-      try {
-        const res = await fetch("/api/analyze-fraud", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(tx),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error ?? "Analysis failed");
-        setAnalysis(data.analysis);
-      } catch (err) {
-        setAnalysisError(err instanceof Error ? err.message : "LLM analysis unavailable");
-      } finally {
-        setAnalyzing(false);
-      }
-    }
-
-    runAnalysis();
-  }, [tx?.id]); // re-run only when a different transaction is opened
 
   const handleAction = async (action: "clear" | "escalate") => {
     if (!tx) return;
@@ -85,8 +40,8 @@ export function TxDrawer({ tx, onClose }: Props) {
         details: {
           previousStatus: tx.status,
           employeeName:   tx.employeeName,
-          llmFraudPattern: analysis?.fraudPattern ?? null,
-          llmConfidence:   analysis?.confidence ?? null,
+          anomalyScore:   tx.anomalyScore,
+          modelVersion:   tx.modelVersion ?? null,
         },
       });
       toast.success(action === "clear" ? "Transaction cleared" : "Transaction escalated");
@@ -97,6 +52,8 @@ export function TxDrawer({ tx, onClose }: Props) {
   };
 
   const fmt = (n: number) => `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`;
+  const pct = (n: number | null | undefined) =>
+    n == null ? "—" : `${(n * 100).toFixed(0)}%`;
 
   return (
     <Sheet open={!!tx} onOpenChange={o => !o && onClose()}>
@@ -105,102 +62,73 @@ export function TxDrawer({ tx, onClose }: Props) {
           <>
             <SheetHeader className="mb-4">
               <SheetTitle className="text-slate-100 text-lg">{tx.employeeName}</SheetTitle>
-              <div className="flex gap-2 flex-wrap">
+              <div className="flex gap-2 flex-wrap items-center">
                 <StatusBadge status={tx.status} />
                 <RiskBadge level={tx.riskLevel} />
-                {(tx as Transaction & { modelVersion?: string }).modelVersion && (
-                  <span className="text-xs text-slate-500 border border-slate-600 rounded px-2 py-0.5">
-                    {(tx as Transaction & { modelVersion?: string }).modelVersion}
+                {tx.modelVersion && (
+                  <span className="text-xs text-slate-500 border border-slate-600 rounded px-2 py-0.5 font-mono">
+                    {tx.modelVersion}
+                  </span>
+                )}
+                {tx.inferenceMs != null && (
+                  <span className={`text-xs rounded px-2 py-0.5 ${tx.inferenceMs <= 220 ? "text-green-400 bg-green-500/10" : "text-amber-400 bg-amber-500/10"}`}>
+                    {tx.inferenceMs}ms
                   </span>
                 )}
               </div>
             </SheetHeader>
 
-            {/* Anomaly Gauge */}
-            <div className="flex justify-center mb-5">
+            {/* Anomaly Gauge — ensemble score */}
+            <div className="flex justify-center mb-2">
               <AnomalyGauge score={tx.anomalyScore} />
             </div>
+            <p className="text-center text-xs text-slate-500 mb-5">Ensemble anomaly score</p>
 
             <div className="space-y-4">
 
-              {/* ── LLM Fraud Analysis ──────────────────────────────────────── */}
+              {/* ── Dual-Model Breakdown ────────────────────────────────────── */}
               <div className="rounded-xl border border-slate-600 overflow-hidden">
                 <div className="flex items-center gap-2 px-3 py-2 bg-slate-900/80 border-b border-slate-700">
                   <span className="text-xs font-semibold text-indigo-400 uppercase tracking-wider">
-                    AI Fraud Analysis
+                    AI Engine — Model Breakdown
                   </span>
-                  <span className="text-xs text-slate-500">claude-sonnet-4-6</span>
-                  {analyzing && (
-                    <span className="ml-auto flex items-center gap-1.5 text-xs text-slate-400">
-                      <span className="w-3 h-3 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
-                      Analysing…
-                    </span>
-                  )}
                 </div>
-
                 <div className="p-3 space-y-3">
-                  {analyzing && !analysis && (
-                    <div className="space-y-2">
-                      {[80, 60, 70].map((w, i) => (
-                        <div key={i} className={`h-3 rounded bg-slate-700 animate-pulse`} style={{ width: `${w}%` }} />
-                      ))}
-                    </div>
-                  )}
-
-                  {analysisError && (
-                    <p className="text-xs text-slate-500 italic">{analysisError}</p>
-                  )}
-
-                  {analysis && (
-                    <>
-                      {/* Headline */}
-                      <p className="text-sm font-semibold text-white leading-snug">
-                        {analysis.headline}
-                      </p>
-
-                      {/* Confidence + Pattern badges */}
-                      <div className="flex flex-wrap gap-2">
-                        <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${confidenceColors[analysis.confidence]}`}>
-                          {analysis.confidence} confidence
-                        </span>
-                        <span className="text-xs px-2 py-0.5 rounded-full border border-slate-600 text-slate-300 bg-slate-700/50">
-                          {analysis.fraudPattern}
-                        </span>
-                      </div>
-
-                      {/* Narrative */}
-                      <p className="text-xs text-slate-300 leading-relaxed">
-                        {analysis.riskNarrative}
-                      </p>
-
-                      {/* Top signal */}
-                      <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2">
-                        <p className="text-xs font-medium text-amber-400 mb-0.5">Primary Signal</p>
-                        <p className="text-xs text-slate-300">{analysis.topSignal}</p>
-                      </div>
-
-                      {/* Recommendation */}
-                      <div className="bg-indigo-500/10 border border-indigo-500/20 rounded-lg px-3 py-2">
-                        <p className="text-xs font-medium text-indigo-400 mb-0.5">Recommended Action</p>
-                        <p className="text-xs text-slate-300">{analysis.recommendation}</p>
-                      </div>
-
-                      {/* False positive note */}
-                      {analysis.falsePositiveReason && (
-                        <div className="bg-green-500/10 border border-green-500/20 rounded-lg px-3 py-2">
-                          <p className="text-xs font-medium text-green-400 mb-0.5">False Positive Note</p>
-                          <p className="text-xs text-slate-300">{analysis.falsePositiveReason}</p>
+                  {tx.modelScores ? (
+                    MODELS.map(({ key, label, sub, color }) => {
+                      const val = tx.modelScores?.[key];
+                      return (
+                        <div key={key}>
+                          <div className="flex items-center justify-between mb-1">
+                            <div>
+                              <span className="text-sm text-slate-200">{label}</span>
+                              <span className="text-xs text-slate-500 ml-2">{sub}</span>
+                            </div>
+                            <span className="text-sm font-mono text-slate-300">{pct(val)}</span>
+                          </div>
+                          <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                            {val != null && (
+                              <div className={`h-full ${color} rounded-full transition-all`} style={{ width: `${Math.round(val * 100)}%` }} />
+                            )}
+                          </div>
+                          {val == null && (
+                            <p className="text-xs text-slate-600 mt-0.5">not trained (no labeled fraud data)</p>
+                          )}
                         </div>
-                      )}
-                    </>
+                      );
+                    })
+                  ) : (
+                    <p className="text-xs text-slate-500 italic">
+                      Scored by rule-based fallback engine — train the model in Config to enable the dual-model breakdown.
+                    </p>
                   )}
                 </div>
               </div>
 
-              {/* ── SHAP Feature Contributions ──────────────────────────────── */}
+              {/* ── SHAP Feature Contributions (Phase 8 XAI) ────────────────── */}
               <ShapChart shap={tx.shapContributions} />
 
-              {/* ── Raw Flag Reasons ────────────────────────────────────────── */}
+              {/* ── Triggered Signals ───────────────────────────────────────── */}
               {tx.flagReasons.length > 0 && (
                 <div className="space-y-1.5">
                   <p className="text-slate-400 text-xs font-medium uppercase tracking-wider">Triggered Signals</p>

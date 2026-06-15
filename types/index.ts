@@ -102,6 +102,14 @@ export interface Transaction {
   routingChangedWithin48h: boolean;
   isBankAccountNew: boolean;
   sharedRoutingHashCount: number;
+  // Dual-model ML engine metadata (optional — absent on older records)
+  modelVersion?: string;
+  inferenceMs?: number;
+  modelScores?: {
+    iforest: number | null;
+    autoencoder: number | null;
+    xgboost: number | null;
+  } | null;
 }
 
 export interface PayrollRun {

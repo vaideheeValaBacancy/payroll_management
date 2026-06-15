@@ -28,6 +28,8 @@ interface MlHealth {
   trainedAt?: string;
   nSamples?: number;
   featureImportance?: Record<string, number>;
+  models?: { isolationForest: boolean; autoencoder: boolean; xgboost: boolean };
+  ensembleWeights?: { isolationForest: number; autoencoder: number; xgboost: number };
 }
 
 export default function ConfigPage() {
@@ -77,14 +79,30 @@ export default function ConfigPage() {
         return;
       }
 
+      // Compute per-department mean gross for the macro baseline feature
+      const deptAgg: Record<string, { sum: number; count: number }> = {};
+      txs.forEach(tx => {
+        const d = deptAgg[tx.department] ?? { sum: 0, count: 0 };
+        d.sum += tx.grossEarningsInr;
+        d.count += 1;
+        deptAgg[tx.department] = d;
+      });
+      const deptMean = (dept: string) => {
+        const d = deptAgg[dept];
+        return d && d.count > 0 ? d.sum / d.count : 0;
+      };
+
       const samples = txs.map(tx => ({
         grossInr:                tx.grossEarningsInr,
-        avgMonthlyPay:           tx.grossEarningsInr, // best proxy available in tx doc
+        avgMonthlyPay:           tx.grossEarningsInr, // best per-employee proxy in tx doc
+        deptMeanPay:             deptMean(tx.department),
         routingChangedWithin48h: tx.routingChangedWithin48h,
         isBankAccountNew:        tx.isBankAccountNew,
         sharedRoutingHashCount:  tx.sharedRoutingHashCount,
         department:              tx.department,
-        isAnomaly:               tx.status === "QUARANTINED" || tx.riskLevel === "CRITICAL" ? true : null,
+        routingHash:             tx.destinationRoutingHash ?? "",
+        // Supervised label: derive from final disposition
+        isAnomaly:               tx.status === "QUARANTINED" || tx.riskLevel === "CRITICAL",
       }));
 
       const res = await fetch("/api/train", {
@@ -354,7 +372,7 @@ export default function ConfigPage() {
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <CardTitle className="text-slate-100 text-base font-semibold">
-                AI Engine — Isolation Forest
+                AI Engine — Dual-Model Topology
               </CardTitle>
               {mlHealth && (
                 <Badge className={mlHealth.online
@@ -373,7 +391,7 @@ export default function ConfigPage() {
               <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-4">
                 <p className="text-amber-400 text-sm font-medium">ML service is offline</p>
                 <p className="text-slate-400 text-xs mt-1">
-                  Run <code className="bg-slate-700 px-1.5 py-0.5 rounded text-indigo-300">cd ml-service && uvicorn main:app --reload</code> to start it.
+                  Run <code className="bg-slate-700 px-1.5 py-0.5 rounded text-indigo-300">cd ml-service &amp;&amp; ./start.sh</code> to start the dual-model engine.
                   The rule-based fallback engine will be used until it&apos;s online.
                 </p>
               </div>
@@ -394,6 +412,31 @@ export default function ConfigPage() {
                     </div>
                   ))}
                 </div>
+
+                {/* Model topology */}
+                {mlHealth.models && (
+                  <div>
+                    <p className="text-slate-400 text-xs uppercase tracking-wider mb-2">Model Topology</p>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {[
+                        { key: "isolationForest", name: "Isolation Forest", tag: "unsupervised", w: mlHealth.ensembleWeights?.isolationForest },
+                        { key: "autoencoder", name: "Autoencoder", tag: "unsupervised", w: mlHealth.ensembleWeights?.autoencoder },
+                        { key: "xgboost", name: "XGBoost", tag: "supervised", w: mlHealth.ensembleWeights?.xgboost },
+                      ].map(({ key, name, tag, w }) => {
+                        const on = mlHealth.models?.[key as keyof typeof mlHealth.models];
+                        return (
+                          <div key={key} className={`rounded-lg border p-3 ${on ? "bg-indigo-600/10 border-indigo-500/30" : "bg-slate-900/50 border-slate-700"}`}>
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <span className={`w-1.5 h-1.5 rounded-full ${on ? "bg-green-400" : "bg-slate-600"}`} />
+                              <p className="text-slate-200 text-sm font-medium">{name}</p>
+                            </div>
+                            <p className="text-slate-500 text-xs">{tag}{w != null ? ` · ${Math.round(w * 100)}% weight` : ""}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {mlHealth.featureImportance && Object.keys(mlHealth.featureImportance).length > 0 && (
                   <div>
