@@ -34,3 +34,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# ML model artifacts
+ml-service/model.pkl
+ml-service/model_meta.json
+ml-service/__pycache__/
