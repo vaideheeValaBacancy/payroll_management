@@ -133,6 +133,18 @@ export interface AuditLog {
   entityId: string;
   performedBy: string;
   details: Record<string, unknown>;
+  // ── Phase 8: cryptographic append-only chain ──────────────────────────────
+  seq?: number;          // monotonic sequence number (gap = deletion)
+  prevHash?: string;     // SHA-256 of the previous entry (genesis = 64 zeros)
+  entryHash?: string;    // SHA-256 of this entry's canonical content + prevHash
+}
+
+export interface AuditChainVerification {
+  valid: boolean;
+  total: number;
+  verified: number;
+  brokenAt: number | null;     // seq where the chain first breaks
+  reason: string | null;
 }
 
 export interface RiskConfig {

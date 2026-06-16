@@ -4,7 +4,8 @@ import {
   Timestamp, writeBatch, QueryConstraint
 } from "firebase/firestore";
 import { db } from "./firebase";
-import type { Employee, Transaction, PayrollRun, AuditLog, RiskConfig } from "@/types";
+import type { Employee, Transaction, PayrollRun, AuditLog, RiskConfig, AuditChainVerification } from "@/types";
+import { GENESIS_HASH, computeEntryHash, verifyChain } from "./auditChain";
 
 // Employees
 export const employeesRef = () => collection(db, "employees");
@@ -59,14 +60,66 @@ export const updatePayrollRun = async (id: string, data: Partial<PayrollRun>) =>
   await updateDoc(doc(db, "payroll_runs", id), data as Record<string, unknown>);
 };
 
-// Audit Log
-export const addAuditLog = async (log: Omit<AuditLog, "id">) => {
-  await addDoc(collection(db, "audit_log"), log);
+// ── Audit Log — Phase 8 cryptographic append-only chain ─────────────────────
+
+// Serialize appends so concurrent calls don't race on the same chain tip.
+// Each append waits for the previous one to finish writing before reading the tip.
+let _auditTail: Promise<void> = Promise.resolve();
+
+/** Read the current chain tip (highest seq entry). */
+const getAuditTip = async (): Promise<{ seq: number; hash: string }> => {
+  const q = query(collection(db, "audit_log"), orderBy("seq", "desc"), limit(1));
+  const snap = await getDocs(q);
+  if (snap.empty) return { seq: 0, hash: GENESIS_HASH };
+  const tip = snap.docs[0].data() as AuditLog;
+  return { seq: tip.seq ?? 0, hash: tip.entryHash ?? GENESIS_HASH };
 };
+
+export const addAuditLog = async (log: Omit<AuditLog, "id" | "seq" | "prevHash" | "entryHash">) => {
+  // Chain onto the serialized tail so the hash chain stays linear.
+  const run = _auditTail.then(async () => {
+    const tip = await getAuditTip();
+    const seq = tip.seq + 1;
+    const prevHash = tip.hash;
+
+    const tsMillis =
+      log.timestamp && typeof log.timestamp.toMillis === "function"
+        ? log.timestamp.toMillis()
+        : Timestamp.now().toMillis();
+
+    const entryHash = await computeEntryHash(
+      {
+        seq,
+        tsMillis,
+        action: log.action,
+        entityType: log.entityType,
+        entityId: log.entityId,
+        performedBy: log.performedBy,
+        details: log.details,
+      },
+      prevHash
+    );
+
+    await addDoc(collection(db, "audit_log"), { ...log, seq, prevHash, entryHash });
+  });
+
+  // Keep the tail alive even if one append fails, so the chain can continue.
+  _auditTail = run.catch(() => {});
+  return run;
+};
+
 export const getAuditLogs = async (): Promise<AuditLog[]> => {
-  const q = query(collection(db, "audit_log"), orderBy("timestamp", "desc"), limit(200));
+  const q = query(collection(db, "audit_log"), orderBy("seq", "desc"), limit(200));
   const snap = await getDocs(q);
   return snap.docs.map(d => ({ ...d.data(), id: d.id } as AuditLog));
+};
+
+/** Verify the full audit chain integrity (tamper / deletion detection). */
+export const verifyAuditChain = async (): Promise<AuditChainVerification> => {
+  const q = query(collection(db, "audit_log"), orderBy("seq", "asc"));
+  const snap = await getDocs(q);
+  const logs = snap.docs.map(d => ({ ...d.data(), id: d.id } as AuditLog));
+  return verifyChain(logs);
 };
 
 // Risk Config
