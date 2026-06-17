@@ -6,6 +6,7 @@ import { ShapChart } from "./ShapChart";
 import { RiskBadge } from "@/components/shared/RiskBadge";
 import { StatusBadge } from "@/components/shared/StatusBadge";
 import { updateTransaction, addAuditLog } from "@/lib/firestore";
+import { humanizeFlag } from "@/lib/flagLabels";
 import { Timestamp } from "firebase/firestore";
 import type { Transaction } from "@/types";
 import toast from "react-hot-toast";
@@ -128,15 +129,22 @@ export function TxDrawer({ tx, onClose }: Props) {
               {/* ── SHAP Feature Contributions (Phase 8 XAI) ────────────────── */}
               <ShapChart shap={tx.shapContributions} />
 
-              {/* ── Triggered Signals ───────────────────────────────────────── */}
+              {/* ── Why this was flagged ────────────────────────────────────── */}
               {tx.flagReasons.length > 0 && (
                 <div className="space-y-1.5">
-                  <p className="text-slate-400 text-xs font-medium uppercase tracking-wider">Triggered Signals</p>
-                  {tx.flagReasons.map(r => (
-                    <div key={r} className="flex items-center gap-2 text-xs text-amber-400 bg-amber-500/10 px-3 py-1.5 rounded">
-                      ⚠ {r.replace(/_/g, " ")}
-                    </div>
-                  ))}
+                  <p className="text-slate-400 text-xs font-medium uppercase tracking-wider">Why this was flagged</p>
+                  {tx.flagReasons.map(r => {
+                    const { title, detail } = humanizeFlag(r);
+                    return (
+                      <div key={r} className="flex gap-2 text-amber-300 bg-amber-500/10 px-3 py-2 rounded">
+                        <span className="leading-5">⚠</span>
+                        <div>
+                          <p className="text-sm font-medium text-amber-200">{title}</p>
+                          {detail && <p className="text-xs text-amber-300/70 mt-0.5">{detail}</p>}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
